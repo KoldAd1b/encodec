@@ -1,148 +1,96 @@
-# EnCodec From Scratch
+# EnCodec
 
-This repository is an in-progress implementation of Meta's EnCodec-style neural audio codec. The goal is to build the model components, train them on local audio data, and scale training across 4 NVIDIA RTX 2080 Ti GPUs.
+This project is an implementation of an EnCodec-style neural audio codec. The goal is to train a model that can compress waveform audio into discrete latent codes and reconstruct high-quality audio from those codes.
 
-## Goal
+EnCodec is useful because the compressed representation is much smaller than raw audio while still preserving enough information for perceptually convincing reconstruction. Those discrete codes can also be used as audio tokens for downstream generative audio models.
 
-EnCodec learns to compress raw audio into discrete codes and reconstruct the waveform from those codes. At a high level, the system should contain:
+## Overview
 
-- A convolutional encoder that downsamples waveform audio into a latent sequence.
-- A residual vector quantizer that converts latents into discrete codebook indices.
-- A convolutional decoder that reconstructs audio from quantized latents.
-- Reconstruction and adversarial losses for high-quality audio generation.
-- A distributed training pipeline that can run efficiently on 4 GPUs.
-
-The current repository contains early building blocks for the convolution stack, LSTM blocks, and residual vector quantization. It does not yet contain the complete EnCodec model or a training pipeline.
-
-## Current Repository State
+The model follows the standard neural codec structure:
 
 ```text
-modules/
-  conv.py        Normalized 1D/2D convolution wrappers and strided audio conv helpers.
-  lstm.py        Sequence LSTM block with optional bidirectional projection and skip connection.
-  quantizer.py   Euclidean codebook, vector quantization, and residual vector quantization.
-```
-
-There is currently no package setup, dependency file, dataset loader, model assembly file, training script, checkpoint logic, evaluation script, or audio demo/inference entrypoint.
-
-## Implemented Components
-
-### Convolution Helpers
-
-`modules/conv.py` defines:
-
-- `NormConv1d`
-- `NormConv2d`
-- `NormTransposeConv1d`
-- `NormTransposeConv2d`
-- `SConv1d`
-- `SConvTranspose1d`
-
-These are intended to support EnCodec-style strided convolution and transpose convolution with optional normalization.
-
-Known issue: `ConvLayerNorm.forward()` currently returns `None` instead of the normalized tensor. Any path using `norm="layer_norm"` will fail until this is fixed.
-
-### LSTM Block
-
-`modules/lstm.py` defines `SLSTM`, a sequence LSTM block that:
-
-- Accepts tensors shaped `(batch, channels, length)`.
-- Internally converts to `(length, batch, channels)` for PyTorch LSTM.
-- Supports bidirectional LSTM output projection.
-- Supports an optional skip connection.
-
-This matches the kind of sequence modeling block often inserted between convolutional stages in neural audio codecs.
-
-### Quantizer
-
-`modules/quantizer.py` defines:
-
-- K-means initialization helpers.
-- An EMA-updated Euclidean codebook.
-- `VectorQuantization`.
-- `ResidualVectorQuantization`.
-
-The quantizer includes early support for distributed training with Hugging Face Accelerate by gathering samples and reducing codebook statistics across processes.
-
-## Target Architecture
-
-The intended model should eventually look like:
-
-```text
-waveform
+audio waveform
   -> encoder
   -> residual vector quantizer
   -> decoder
   -> reconstructed waveform
 ```
 
-The training objective should combine:
+The encoder converts raw audio into a lower-rate latent sequence. The quantizer maps that latent sequence into discrete codebook entries. The decoder converts the quantized representation back into waveform audio.
 
-- Time-domain reconstruction loss, such as L1 over waveform samples.
-- Frequency-domain reconstruction loss, such as multi-scale STFT loss.
-- Commitment loss from the vector quantizer.
-- Optional adversarial loss with multi-scale or multi-period audio discriminators.
-- Optional feature matching loss from discriminator intermediate activations.
+## Main Components
 
-## Training Target
+The project is organized around a few core model components:
 
-The intended hardware target is 4x RTX 2080 Ti GPUs.
+- **Encoder**: a stack of 1D convolutional blocks that downsamples the waveform into latent features.
+- **Sequence modeling**: optional recurrent or temporal layers that improve context modeling inside the latent representation.
+- **Residual vector quantizer**: a sequence of vector quantizers that progressively encode the residual error between the encoder output and the quantized approximation.
+- **Decoder**: a stack of transposed convolutional blocks that upsamples quantized latents back to waveform audio.
+- **Losses**: reconstruction, spectral, commitment, and optionally adversarial losses for improving perceptual quality.
+- **Training loop**: dataset loading, audio preprocessing, distributed training, checkpointing, validation, and sample export.
 
-Important constraints for 2080 Ti training:
+## Training Objective
 
-- Each GPU usually has 11 GB VRAM, so batch size and audio segment length need to be conservative.
-- Mixed precision should be used where stable.
-- Distributed data parallel training should be used through Accelerate or native PyTorch DDP.
-- Gradient accumulation will probably be needed for larger effective batch sizes.
-- Checkpointing should save model weights, optimizer state, scheduler state, quantizer buffers, and training step.
+The model should learn to reconstruct audio while keeping the bottleneck discrete and compact. A typical training objective combines:
 
-Recommended initial training setup:
+- Waveform reconstruction loss.
+- Multi-scale spectral reconstruction loss.
+- Quantizer commitment loss.
+- Optional adversarial loss from audio discriminators.
+- Optional feature matching loss from discriminator activations.
+
+The reconstruction-only objective should work first. Adversarial training should be added only after the autoencoder path is stable, because discriminator losses make debugging much harder.
+
+## Quantization
+
+The quantizer uses residual vector quantization. Instead of relying on one codebook to represent the full latent vector, multiple quantizers are applied in sequence. Each quantizer encodes the residual left by the previous one:
 
 ```text
-sample_rate: 24000 or 48000
-segment_seconds: 1 to 3
-per_gpu_batch_size: start with 2 to 4
-gradient_accumulation_steps: tune based on memory
-precision: fp16 or bf16 if supported
-num_processes: 4
+residual_0 = encoder_output
+code_0 = quantizer_0(residual_0)
+residual_1 = residual_0 - decode(code_0)
+code_1 = quantizer_1(residual_1)
+...
 ```
 
-The 2080 Ti does not support bf16 acceleration like newer GPUs, so fp16 is the practical mixed-precision target.
+The final quantized representation is the sum of all selected codebook vectors. This makes it possible to trade bitrate against quality by changing the number of active quantizers.
 
-## Missing Work
+## Dataset Expectations
 
-Before full training is possible, the project needs:
+Training data should be a collection of audio files. The training pipeline should handle:
 
-1. A dependency file, such as `requirements.txt` or `pyproject.toml`.
-2. A complete encoder module.
-3. A complete decoder module.
-4. A top-level EnCodec model class that wires encoder, quantizer, and decoder together.
-5. Dataset loading for audio files.
-6. Audio preprocessing and random crop logic.
-7. Training configuration.
-8. Distributed training script.
-9. Reconstruction losses.
-10. Optional discriminator models and adversarial losses.
-11. Checkpoint save/resume.
-12. Validation loop.
-13. Audio reconstruction export for listening tests.
-14. Unit tests or smoke tests for tensor shapes and encode/decode round trips.
+- Loading common audio formats.
+- Resampling to the configured sample rate.
+- Converting to mono or preserving channels, depending on the model target.
+- Random cropping fixed-length segments.
+- Normalizing audio levels consistently.
+- Skipping unreadable or too-short files.
 
-## Suggested Development Order
+Validation should export reconstructed audio examples so model quality can be checked by listening, not only by scalar losses.
 
-1. Fix module-level correctness issues.
-2. Add a minimal dependency file.
-3. Add unit tests for `SConv1d`, `SConvTranspose1d`, `SLSTM`, and `ResidualVectorQuantization`.
-4. Implement the encoder and decoder.
-5. Implement a top-level model forward pass.
-6. Add a simple waveform reconstruction training loop on one GPU.
-7. Add Accelerate configuration for 4 GPUs.
-8. Add validation and audio sample export.
-9. Add adversarial training after reconstruction-only training is stable.
+## Development Priorities
 
-## Local Environment
+The first milestone is a minimal end-to-end model:
 
-The current local environment used during inspection did not have `torch` installed, so runtime smoke tests could not be executed. At minimum, this project will need:
+```text
+audio batch -> encoder -> quantizer -> decoder -> reconstruction loss
+```
+
+Recommended order:
+
+1. Add project dependencies and a repeatable environment setup.
+2. Add smoke tests for tensor shapes and encode/decode round trips.
+3. Implement the encoder and decoder.
+4. Add a top-level model class that wires the encoder, quantizer, and decoder together.
+5. Add a small single-device training loop with waveform and spectral reconstruction losses.
+6. Add checkpoint save/resume.
+7. Add validation and reconstructed audio export.
+8. Add distributed training support.
+9. Add adversarial training once reconstruction-only training is stable.
+
+## Dependencies
+
+Core dependencies are expected to include:
 
 ```text
 torch
@@ -151,40 +99,46 @@ einops
 accelerate
 numpy
 tqdm
-soundfile or scipy
+soundfile
 ```
 
-Optional dependencies will likely include:
+Useful optional dependencies:
 
 ```text
 auraloss
-tensorboard or wandb
+tensorboard
+wandb
 matplotlib
 pytest
 ```
 
-## Example Launch Direction
+The exact dependency list should be captured in a `requirements.txt`, `environment.yml`, or `pyproject.toml` once the training stack is finalized.
 
-Once a training script exists, the intended distributed launch should be similar to:
+## Training
 
-```bash
-accelerate launch --num_processes 4 train.py --config configs/encodec.yaml
-```
-
-or:
+The training entrypoint should eventually support configuration-driven runs, for example:
 
 ```bash
-torchrun --nproc_per_node=4 train.py --config configs/encodec.yaml
+python train.py --config configs/encodec.yaml
 ```
 
-The exact command depends on whether the project standardizes on Accelerate or native PyTorch DDP.
+For distributed training, the project can use either Hugging Face Accelerate or native PyTorch distributed launch. The final choice should be reflected in the training scripts and configuration files.
 
-## Current Status
+## Evaluation
 
-This is not yet a trainable EnCodec implementation. It is a small prototype containing several low-level modules that can become part of the full model. The next milestone should be a minimal end-to-end autoencoder path:
+Evaluation should include both objective and subjective checks:
 
-```text
-audio batch -> encoder -> quantizer -> decoder -> reconstruction loss
-```
+- Reconstruction loss on held-out audio.
+- Spectral loss on held-out audio.
+- Codebook usage statistics.
+- Reconstructed audio samples.
+- Compression bitrate for a chosen number of quantizers.
 
-Once that works on a single GPU, distributed training across the 4x 2080 Ti setup can be added and validated.
+Listening tests matter for this project. Low loss does not always mean the reconstructed audio sounds good.
+
+## References
+
+- Meta AI, **High Fidelity Neural Audio Compression**
+- Meta's EnCodec implementation and released model behavior
+- SoundStream-style residual vector quantization
+- Multi-scale STFT losses for neural audio generation
