@@ -49,6 +49,7 @@ def main():
     with torch.no_grad():
         tokens, scale = model.tokenize(audio)
 
+
     print(tokens)
 
 

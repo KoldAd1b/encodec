@@ -29,6 +29,9 @@ class SlowSnake(nn.Module):
 
         return x
 
+
+Snake = SlowSnake
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_T': 64}, num_warps=2),
