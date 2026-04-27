@@ -21,14 +21,13 @@ class SEANetResnetBlock(nn.Module):
         
         super().__init__()
 
-        ### Output channel dimensions 
         hidden = dim // compress
         act = getattr(nn, activation) if activation != "Snake" else Snake
 
         block = []
         for i, (kernel_size, dilation) in enumerate(zip(kernel_sizes, dilations)):
-            in_channels = dim if i == 0 else hidden # input with dim, everything else after input hidden
-            out_channels = dim if i == len(kernel_sizes) - 1 else hidden # output is first hidden, at the end back to dim
+            in_channels = dim if i == 0 else hidden
+            out_channels = dim if i == len(kernel_sizes) - 1 else hidden
             
             block += [
                 act(**activation_params) if activation != "Snake" else act(in_channels),
@@ -38,11 +37,8 @@ class SEANetResnetBlock(nn.Module):
 
         self.block = nn.Sequential(*block)
         
-        ### If true_skip we will just add input to output ###
         if true_skip:
             self.shortcut = nn.Identity()
-
-        ### Otherwise we project the input and then add to output ###
         else:
             self.shortcut = SConv1d(dim, dim, kernel_size=1,
                                     norm=norm, norm_kwargs=norm_params, 
@@ -81,23 +77,17 @@ class SEANetEncoder(nn.Module):
         self.n_residual_layers = n_residual_layers
         self.hop_length = np.prod(self.ratios)
 
-        ### Get activation function 
         act = getattr(nn, activation) if activation != "Snake" else Snake
-
-        ### Initialize multiplier ###
         mult = 1
 
-        ### Start model from input channels to starting n_filters channels ###
         model = [
             SConv1d(channels, mult * n_filters, kernel_size,
                     norm=norm, norm_kwargs=norm_params, 
                     pad_mode=pad_mode)
         ]
 
-        ### For each downsample block ###
         for i, ratio in enumerate(self.ratios):
 
-            ### We have n_residual_layers first
             for j in range(n_residual_layers):
 
                 model += [
@@ -110,23 +100,19 @@ class SEANetEncoder(nn.Module):
                     )
                 ]
 
-            ### Followed by the downsample ###
             model += [
                 act(**activation_params) if activation != "Snake" else act(mult * n_filters),
                 SConv1d(mult * n_filters, mult * n_filters * 2, 
-                        kernel_size=ratio * 2, stride=ratio, # stride=ratio will downsample by that factor
+                        kernel_size=ratio * 2, stride=ratio,
                         norm=norm, norm_kwargs=norm_params, 
                         pad_mode=pad_mode)
             ]
 
-            ### update mult for the next iteration
             mult *= 2
 
-        ### Add on LSTM layers
         if lstm:
             model += [SLSTM(mult * n_filters, num_layers=lstm, bidirectional=lstm_bidirectional)]
         
-        ### Post process with a final convolution ###
         model += [
             act(**activation_params) if activation != "Snake" else act(mult * n_filters),
             SConv1d(mult * n_filters, dimension, last_kernel_size, 
@@ -174,7 +160,6 @@ class SEANetDecoder(nn.Module):
         act = getattr(nn, activation) if activation != "Snake" else Snake
         mult = int(2 ** len(self.ratios))
 
-        ### This will basically be opposite of the Encoder 
         model = [
             SConv1d(dimension, mult * n_filters, kernel_size, 
                     norm=norm, norm_kwargs=norm_params, 
@@ -214,7 +199,6 @@ class SEANetDecoder(nn.Module):
                     pad_mode=pad_mode)
         ]
 
-        ### Add an optional final activation (like tanh)
         if final_activation is not None:
             final_act = getattr(nn, final_activation)
             final_activation_params = final_activation_params or {}

@@ -1,7 +1,3 @@
-"""
-EnCodec only uses the MultiScaleSTFTDiscriminator, but we additionally add on
-MultiPeriod and MultiScale (time domain) discriminators from the HIFIGAN so we 
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,12 +16,10 @@ class DisciminatorConfig:
     in_channels: int = 1
     out_channels: int = 1
 
-    ### Filter Control ###
     filters: int = 32
     max_filters: int = 1024
     filter_scale: int = 1
 
-    ### Multiscale STFT Discriminator ###
     use_multiscale_freq_discrim: bool = True
     n_ffts: Tuple[int, ...] = (2048, 1024, 512, 256, 128)
     hop_lengths: Tuple[int, ...] = (512, 256, 128, 64, 32)
@@ -38,22 +32,17 @@ class DisciminatorConfig:
     activation: str = "LeakyReLU"
     activation_params: Dict[str, Any] = field(default_factory=lambda: {'negative_slope': 0.2})
     
-    ### Multiscale (time) Discriminator ###
     use_multiscale_time_discrim: bool = True
     msd_num_downsamples: int = 2
     msd_kernel_size: int = 5
     msd_stride: int = 3
 
-    ### Multiperiod Discriminator ###
     use_multiperiod_time_discrim: bool = True
     mpd_periods: Tuple[int, ...] = (2,3,5,7,11)
     
 def init_weights(m, mean=0.0, std=0.01):
-    """standard weight init for all Conv modules"""
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
-        # NormConv2d nests the Conv inside the module so we have to 
-        # go one more in!
         if hasattr(m, "conv"):
             m = m.conv
         m.weight.data.normal_(mean, std)
@@ -83,39 +72,32 @@ class DiscriminatorSTFT(nn.Module):
         self.normalized = normalized
         self.activation = getattr(torch.nn, activation)(**activation_params)
 
-        ### Spectrogram Operation ###
         self.spec_transform = torchaudio.transforms.Spectrogram(
             n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length, 
             window_fn=torch.hann_window, normalized=self.normalized, center=False, 
             pad_mode=None, power=None)
         
-        ### Build Convs ###
         self.convs = nn.ModuleList()
 
-        ### Initial input from our concatenated spectrogram (real and imaginary) ###
         spec_channels = 2 * self.in_channels
         self.convs.append(
             NormConv2d(spec_channels, self.filters, kernel_size=kernel_size, padding=get_2d_padding(kernel_size))
         )
 
-        in_channels = min(filter_scale * self.filters, max_filters) # increase until we reach max
-        
-        ### for every conv (num convs set by dilations)
+        in_channels = min(filter_scale * self.filters, max_filters)
         
         for i, dilation in enumerate(dilations):
             out_channels = min((filter_scale ** (i + 1)) * self.filters, max_filters)
             self.convs.append(NormConv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
                                          dilation=(dilation, 1), padding=get_2d_padding(kernel_size, (dilation, 1)),
                                          norm=norm))
-            in_channels = out_channels # update for next operation
+            in_channels = out_channels
 
-        ### Get the next out_channels after the dilations (+1) for a non-dilated convolution
         out_channels = min((filter_scale ** (len(dilations) + 1)) * self.filters, max_filters)
         self.convs.append(NormConv2d(in_channels, out_channels, kernel_size=(kernel_size[0], kernel_size[0]),
                                      padding=get_2d_padding((kernel_size[0], kernel_size[0])),
                                      norm=norm))
         
-        ### final conv to out_channels
         self.conv_post = NormConv2d(out_channels, self.out_channels,
                                     kernel_size=(kernel_size[0], kernel_size[0]),
                                     padding=get_2d_padding((kernel_size[0], kernel_size[0])),
@@ -124,11 +106,10 @@ class DiscriminatorSTFT(nn.Module):
     def forward(self, x):
 
         fmap = []
-        z = self.spec_transform(x) # returns both real and complex parts
-        z = torch.cat([z.real, z.imag], dim=1) # concat together real and complex
-        z = einops.rearrange(z, 'b c w t -> b c t w') # make it the standard image shape
+        z = self.spec_transform(x)
+        z = torch.cat([z.real, z.imag], dim=1)
+        z = einops.rearrange(z, 'b c w t -> b c t w')
      
-        ### loop through convs while keeping intermediate feature maps
         for i, layer in enumerate(self.convs):
             z = layer(z)
             z = self.activation(z)
@@ -139,9 +120,6 @@ class DiscriminatorSTFT(nn.Module):
         return z, fmap
     
 class MultiScaleSTFTDiscriminator(nn.Module):
-    """
-    Multi-Scale STFT (MS-STFT) discriminator.
-    """
     def __init__(self, config):
         
         super().__init__()
@@ -177,8 +155,6 @@ class MultiScaleSTFTDiscriminator(nn.Module):
         return real_outs, gen_outs, real_feat_maps, gen_feat_maps
             
 class PeriodicDiscriminator(nn.Module):
-    """A smaller version of the original PeriodicDiscriminator to reduce
-    parameter count to make it more similar to the MSSTFT Discriminator"""
     def __init__(self, 
                  period, 
                  in_channels=1, 
@@ -401,9 +377,3 @@ class Discriminator(nn.Module):
             gen_feat_maps.extend(_gen_feat_maps)
 
         return real_outs, gen_outs, real_feat_maps, gen_feat_maps
-
-
-
-
-    
-        

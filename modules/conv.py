@@ -5,18 +5,17 @@ import math
 import einops
 from torch.nn.utils.parametrizations import spectral_norm, weight_norm
 
-CONV_NORMALIZATIONS = ['none', # No normalization
-                       'weight_norm', 'spectral_norm', # Weight parameterization normalization 
-                       'time_layer_norm', 'layer_norm', 'time_group_norm' # standard normalization
+CONV_NORMALIZATIONS = ['none',
+                       'weight_norm', 'spectral_norm',
+                       'time_layer_norm', 'layer_norm', 'time_group_norm'
                        ]
 
 class ConvLayerNorm(nn.LayerNorm):
 
     """
-    Typical data shape for layernorm is (B x L x E), and we normalize
-    over the embedding dimension E. But if our data is images 
-    like (B x C x H x W), or if its a sequence (B x C x L) we will permute our
-    data to have Channels last and norm along that dimension, and then return it back!
+    LayerNorm expects the normalized dimension last.
+    For convolution tensors shaped (B, C, T) or (B, C, ..., T), move time
+    before the channel/spatial dimensions, normalize, then restore the layout.
     """
 
     def __init__(self, 
@@ -28,13 +27,12 @@ class ConvLayerNorm(nn.LayerNorm):
         x = einops.rearrange(x, 'b ... t -> b t ...')
         x = super().forward(x)
         x = einops.rearrange(x, 'b t ... -> b ... t')
-        return
+        return x
 
 def apply_parameterization_norm(module, norm):
 
     """
-    If we are using a reparameterization norm this is 
-    where we apply it to the weights of our convolutions
+    Apply weight-based normalization to a convolution module when requested.
     """
     
     assert norm in CONV_NORMALIZATIONS
@@ -43,28 +41,23 @@ def apply_parameterization_norm(module, norm):
     elif norm == "spectral_norm":
         return spectral_norm(module)
     else:
-        # Dont apply anything as we are using either "none" or a flavor of layernorm
+        # Activation/output normalizations are applied separately after the conv.
         return module
     
 def get_norm_module(module, norm, **norm_kwargs):
     """
-    If we are doing a layernorm, this is where we define it
+    Return the output normalization paired with a convolution module.
     """
     assert norm in CONV_NORMALIZATIONS
     if norm == "layer_norm":
         return ConvLayerNorm(module.out_channels, **norm_kwargs)
     elif norm == "time_group_norm":
-        # Groupnorm with 1 group is not exactly the same as 
-        # layernorm and you can see some details here:
-        # https://discuss.pytorch.org/t/groupnorm-num-groups-1-and-layernorm-are-not-equivalent/145468
+
         return nn.GroupNorm(1, module.out_channels, **norm_kwargs)
     else:
         return nn.Identity()
 
 class NormConv1d(nn.Module):
-    """
-    Putting together conv1d and norm
-    """
     def __init__(self, *args, norm="none", norm_kwargs={}, **kwargs):
         super().__init__()
         self.conv = apply_parameterization_norm(
@@ -77,9 +70,6 @@ class NormConv1d(nn.Module):
         return self.norm(self.conv(x))
     
 class NormConv2d(nn.Module):
-    """
-    Putting together conv2d and norm
-    """
     def __init__(self, *args, norm="none", norm_kwargs={}, **kwargs):
         super().__init__()
         self.conv = apply_parameterization_norm(
@@ -92,9 +82,6 @@ class NormConv2d(nn.Module):
         return self.norm(self.conv(x))
     
 class NormTransposeConv1d(nn.Module):
-    """
-    Putting together transposeconv1d and norm
-    """
     def __init__(self, *args, norm="none", norm_kwargs={}, **kwargs):
         super().__init__()
         self.convtr = apply_parameterization_norm(
@@ -107,9 +94,6 @@ class NormTransposeConv1d(nn.Module):
         return self.norm(self.convtr(x))
 
 class NormTransposeConv2d(nn.Module):
-    """
-    Putting together transposeconv2d and norm
-    """
     def __init__(self, *args, norm="none", norm_kwargs={}, **kwargs):
         super().__init__()
         self.convtr = apply_parameterization_norm(
@@ -124,34 +108,26 @@ class NormTransposeConv2d(nn.Module):
 def get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total=0):
 
     """
-    length=10, kernel_size=3, stride=2, padding_total=2
-    n_frames = (10 - 3 + 2) / 2 + 1 = 5.5
-    ideal_length = (6 - 1) * 2 + (3 - 2) = 5 * 2 + 1 = 11
-
-
+    Return the extra right padding needed so every strided convolution window
+    is complete. This makes the output length ceil(input_length / stride)
+    instead of dropping a partial final window.
     """
     
     length = x.shape[-1]
 
-    ### What is our expected output size (this is fractional if there is an incomplete window)
+    # Fractional frame counts indicate a final incomplete convolution window.
     n_frames = (length - kernel_size + padding_total) / stride + 1
 
-    ### If n_frame is a fraction, then the question is how how many samples do we need to add to 
-    ### the input data to make sure n_frames is no longer fractional
-    ### math.ceil rounds up to get full frames
-    ### - 1 gives us he number of stride steps we need
-    ### multiply by strides to get distance covered
-    ### kernel_size - padding_total adjusts for the overhang of the final kernel window
-    ### The last frame starts at position `(n_frames - 1) * stride`, but the kernel extends
-    ### beyond this starting position by `kernel_size - 1` positions. However, we already added 
-    ### padding_total which will be added to the input, so we subtract it out.
+    # Compute the input length required to realize ceil(n_frames) full windows.
     ideal_length = (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
 
     return ideal_length - length
 
 def pad1d(x, paddings, mode="zero", value=0):
-    """Tiny wrapper around F.pad, just to allow for reflect padding on small input.
-    If this is the case, we insert extra 0 padding to the right before the reflection happen.
+    """
+    Pad a 1D signal, with a fallback for reflect padding on very short inputs.
+    Reflection requires the input to be longer than the padding size, so short
+    inputs are temporarily zero-padded on the right before reflection.
     """
     length = x.shape[1]
     padding_left, padding_right = paddings
@@ -159,9 +135,9 @@ def pad1d(x, paddings, mode="zero", value=0):
     if mode == "reflect":
         max_pad = max(padding_left, padding_right)
         extra_pad = 0
-        if length <= max_pad: # cant do reflect padding if we dont have enough to reflect
-            extra_pad = max_pad - length + 1 # compute number of samples to add on so we can reflect
-            x = F.pad(x,(0, extra_pad)) # Pad with zeros
+        if length <= max_pad:
+            extra_pad = max_pad - length + 1
+            x = F.pad(x,(0, extra_pad))
         padded = F.pad(x, paddings, mode, value)
         end = padded.shape[-1] - extra_pad
         return padded[..., :end]
@@ -199,7 +175,7 @@ class SConv1d(nn.Module):
         self.norm = norm 
         self.pad_mode = pad_mode
 
-        ### Define the Normalized Convolution
+        # Padding is applied manually in forward().
         self.conv = NormConv1d(
             in_channels, out_channels, kernel_size, stride, 
             dilation=dilation, groups=groups, bias=bias, 
@@ -208,41 +184,20 @@ class SConv1d(nn.Module):
 
     def forward(self, x):
 
-        ### Input (sequence) data shape 
         batch, channels, seq_len = x.shape
 
-        ### If our convolution is dilated, then the kernel size
-        ### will effectively be larger than what it really is. 
-        ### for example if we have a kernel size of 3, with a dilation
-        ### of 2, every conv operation will see over a range of 5
-        ### values (with holes in between)
-        kernel_size = (self.kernel_size - 1) * self.dilation + 1 # compute the effective kernel size
+        # Dilation increases the time span covered by a kernel.
+        # Example: kernel_size=3, dilation=2 spans 5 samples.
+        kernel_size = (self.kernel_size - 1) * self.dilation + 1
 
-        ### We want to make sure we add enough padding to ensure the output = input / stride
-        ### the standard conv output formula is:
-        ### output_length = floor((input_length + padding_total - kernel_size) / stride) + 1
-        ### For simplicity lets assume that things divide evenly so we dont have a floor function (we handle this later)
-        ### output_length = ((input_length + padding_total - kernel_size) / stride) + 1
-        ### If padding_total = kernel_size - stride, we get:
-        ### output_length = ((input_length + kernel_size - stride - kernel_size) / stride) + 1
-        ### output_length = ((input_length - stride) / stride) + 1
-        ### output_length = (input_length/stride) - (stride / stride) + 1
-        ### output_length = (input_length/stride) - 1 + 1
-        ### output_length = (input_length/stride)
-        padding_total = kernel_size - self.stride # the total padding we have to add to our signal to get expected downsampling
+        # Choose padding so the strided conv produces roughly T / stride frames:
+        # output = floor((T + padding_total - kernel_size) / stride) + 1.
+        padding_total = kernel_size - self.stride
 
-        ### Now we had that assumption that things divide evenly. This only works if every convolution
-        ### window is full. For example:
-        ### For instance, with total padding = 4, kernel size = 4, stride = 2:
-        ### 0 0 1 2 3 4 5 0 0   # (0s are padding)
-        ### 1   2   3           # (output frames of a convolution, last 0 is never used)
-
-        ### We then can compute extra_padding = 1 and we add an extra 0 padding to our data
-        ### 0 0 1 2 3 4 5 0 0 0   # (0s are padding)
-        ### 1   2   3   4         # (output frames of a convolution, last 0 is now used)
+        # Add right padding when T is not stride-aligned, so the last partial
+        # window becomes a full convolution window instead of being dropped.
         extra_padding = get_extra_padding_for_conv1d(x, kernel_size, self.stride, padding_total)
  
-        ### Now we add padding to both sides of the data 
         padding_right = padding_total // 2
         padding_left = padding_total - padding_right
         x = pad1d(x, (padding_left, padding_right + extra_padding), mode=self.pad_mode)
@@ -276,19 +231,9 @@ class SConvTranspose1d(nn.Module):
 
         y = self.convtr(x)
 
-        ### We added two kinds of padding in the encoder
-        ### the padding_total and the extra padding. the
-        ### padding_total is deterministic, computed based on 
-        ### the convolution configuration. On the other hand 
-        ### the extra_padding is dynamic, based on the input 
-        ### length to ensure complete frame coverage. 
-        ### when decoding, we will remove the padding 
-        ### that was added in by the encoding, but we will
-        ### only remove the padding_total. We dont know exactly
-        ### the extra_padding from the encoder, as removing it here would 
-        ### require also passing the length at the matching layer
-        ### in the encoder. So for simplicity we will remove what we know
-        ### and then remove anything leftover at the end of the model!
+        # Remove the deterministic padding paired with SConv1d. The dynamic
+        # extra padding depends on the original input length and is handled by
+        # final output trimming at the model level.
         padding_right = padding_total // 2
         padding_left = padding_total - padding_right
         y = unpad1d(y, (padding_left, padding_right))
@@ -302,7 +247,7 @@ if __name__ == "__main__":
                     kernel_size=11,
                     stride=2)
     
-    rand = torch.randn(4,16,100) # expect with a stride of 2 to half L
+    rand = torch.randn(4,16,100)
     
     print(rand.shape)
     conv_out = sconv(rand)
