@@ -1,8 +1,11 @@
 # EnCodec
 
-This project is an implementation of an EnCodec-style neural audio codec. The goal is to train a model that can compress waveform audio into discrete latent codes and reconstruct high-quality audio from those codes.
+This repository implements an EnCodec-style neural audio codec in Python and
+PyTorch. The model compresses waveform audio into discrete latent codes with
+residual vector quantization, then reconstructs audio from those codes.
 
-EnCodec is useful because the compressed representation is much smaller than raw audio while still preserving enough information for perceptually convincing reconstruction. Those discrete codes can also be used as audio tokens for downstream generative audio models.
+The compressed codes are much smaller than raw audio and can also be reused as
+audio tokens for downstream generative audio models.
 
 ## Overview
 
@@ -16,125 +19,181 @@ audio waveform
   -> reconstructed waveform
 ```
 
-The encoder converts raw audio into a lower-rate latent sequence. The quantizer maps that latent sequence into discrete codebook entries. The decoder converts the quantized representation back into waveform audio.
+The encoder converts raw audio into a lower-rate latent sequence. The quantizer
+maps that latent sequence into discrete codebook entries. The decoder converts
+the quantized representation back into waveform audio.
 
-## Main Components
+## Project Layout
 
-The project is organized around a few core model components:
+- `modules/encodec.py`: top-level generator that wires the encoder, quantizer,
+  and decoder.
+- `modules/seanet.py`, `modules/conv.py`, `modules/lstm.py`, `modules/snake.py`:
+  core encoder/decoder building blocks.
+- `modules/quantizer.py`: residual vector quantization.
+- `modules/discriminator.py`: adversarial audio discriminators.
+- `loss.py`: reconstruction, spectral, feature matching, generator, and
+  discriminator losses.
+- `balancer.py`: gradient-balancing helper for multi-loss generator training.
+- `dataset.py`: random segment audio dataset.
+- `train.py`: `EncodecTrainer` implementation.
+- `run.py`: configuration-driven training entrypoint.
+- `audio_tokenize.py`: tokenization example.
+- `inference.py`: reconstruction and mel comparison example.
+- `build_db.py`: audio manifest builder.
+- `pre.py`: optional long-audio chunking helper.
+- `config/config.yaml`: runtime configuration.
 
-- **Encoder**: a stack of 1D convolutional blocks that downsamples the waveform into latent features.
-- **Sequence modeling**: optional recurrent or temporal layers that improve context modeling inside the latent representation.
-- **Residual vector quantizer**: a sequence of vector quantizers that progressively encode the residual error between the encoder output and the quantized approximation.
-- **Decoder**: a stack of transposed convolutional blocks that upsamples quantized latents back to waveform audio.
-- **Losses**: reconstruction, spectral, commitment, and optionally adversarial losses for improving perceptual quality.
-- **Training loop**: dataset loading, audio preprocessing, distributed training, checkpointing, validation, and sample export.
+## Data Preparation
 
-## Training Objective
-
-The model should learn to reconstruct audio while keeping the bottleneck discrete and compact. A typical training objective combines:
-
-- Waveform reconstruction loss.
-- Multi-scale spectral reconstruction loss.
-- Quantizer commitment loss.
-- Optional adversarial loss from audio discriminators.
-- Optional feature matching loss from discriminator activations.
-
-The reconstruction-only objective should work first. Adversarial training should be added only after the autoencoder path is stable, because discriminator losses make debugging much harder.
-
-## Quantization
-
-The quantizer uses residual vector quantization. Instead of relying on one codebook to represent the full latent vector, multiple quantizers are applied in sequence. Each quantizer encodes the residual left by the previous one:
-
-```text
-residual_0 = encoder_output
-code_0 = quantizer_0(residual_0)
-residual_1 = residual_0 - decode(code_0)
-code_1 = quantizer_1(residual_1)
-...
-```
-
-The final quantized representation is the sum of all selected codebook vectors. This makes it possible to trade bitrate against quality by changing the number of active quantizers.
-
-## Dataset Expectations
-
-Training data should be a collection of audio files. The training pipeline should handle:
-
-- Loading common audio formats.
-- Resampling to the configured sample rate.
-- Converting to mono or preserving channels, depending on the model target.
-- Random cropping fixed-length segments.
-- Normalizing audio levels consistently.
-- Skipping unreadable or too-short files.
-
-Validation should export reconstructed audio examples so model quality can be checked by listening, not only by scalar losses.
-
-## Development Priorities
-
-The first milestone is a minimal end-to-end model:
+Training uses text manifests by default. Each line should contain one path to an
+audio file:
 
 ```text
-audio batch -> encoder -> quantizer -> decoder -> reconstruction loss
+/path/to/audio_0001.wav
+/path/to/audio_0002.flac
+/path/to/audio_0003.mp3
 ```
 
-Recommended order:
+Create train and test manifests from an audio directory with:
 
-1. Add project dependencies and a repeatable environment setup.
-2. Add smoke tests for tensor shapes and encode/decode round trips.
-3. Implement the encoder and decoder.
-4. Add a top-level model class that wires the encoder, quantizer, and decoder together.
-5. Add a small single-device training loop with waveform and spectral reconstruction losses.
-6. Add checkpoint save/resume.
-7. Add validation and reconstructed audio export.
-8. Add distributed training support.
-9. Add adversarial training once reconstruction-only training is stable.
+```bash
+python build_db.py /path/to/audio_root --split --train_ratio 0.9 \
+  --train_file data/train.txt \
+  --test_file data/test.txt
+```
+
+The checked-in config already points to those files:
+
+```yaml
+path_to_train_manifest: data/train.txt
+path_to_test_manifest: data/test.txt
+```
+
+The dataset loader handles common preprocessing at training time:
+
+- loads each path from the manifest
+- resamples to `training_config.sampling_rate`
+- averages multi-channel audio to mono
+- randomly crops `training_config.segment_length`
+- pads clips shorter than `segment_length`
+
+If your source files are very long and expensive to load repeatedly, chunk them
+first:
+
+```bash
+python pre.py /path/to/long_audio data/chunks --duration 15 --keep-remainder
+python build_db.py data/chunks --split --train_ratio 0.9 \
+  --train_file data/train.txt \
+  --test_file data/test.txt
+```
+
+Short utterance datasets usually only need the manifest step.
+
+## Training
+
+Start a configured training run with:
+
+```bash
+python run.py --path_to_config config/config.yaml
+```
+
+For distributed training, launch the same entrypoint through Accelerate:
+
+```bash
+accelerate launch run.py --path_to_config config/config.yaml
+```
+
+Checkpoints, cached train/test splits, selected generation inputs, and generated
+reconstructions are written under:
+
+```text
+dir/<experiment_name>/
+```
+
+The training loop supports:
+
+- manifest or directory-based dataset construction
+- cached train/test splits for resume consistency
+- generator-only or adversarial training
+- cosine learning-rate schedules with warmup
+- optional gradient clipping
+- optional loss balancing
+- periodic validation
+- periodic reconstructed sample export
+- Accelerate checkpoint save and resume state
+
+## Tokenization And Inference
+
+`audio_tokenize.py` loads a configured model checkpoint and prints discrete
+tokens for the first path in `data/test.txt`.
+
+Verify paths before running it. The script currently contains explicit constants
+for the config, checkpoint, and manifest locations.
+
+```bash
+python audio_tokenize.py
+```
+
+`inference.py` is a reconstruction example that tokenizes one audio file, decodes
+it, saves reconstructed audio, and writes a mel-spectrogram comparison. It also
+uses explicit local paths that should be edited before use.
+
+```bash
+python inference.py
+```
+
+## Validation
+
+Run a quick syntax check across the project with:
+
+```bash
+python -m py_compile audio_tokenize.py dataset.py loss.py modules/*.py \
+  balancer.py build_db.py inference.py pre.py run.py train.py utils.py
+```
+
+Check distributed tensor broadcast behavior with:
+
+```bash
+accelerate launch modules/gather_test.py
+```
+
+When tests are added, place them under `tests/` and run:
+
+```bash
+python -m pytest
+```
+
+Prioritize smoke tests for tensor shapes, encode/decode round trips, quantizer
+codebook behavior, config construction, and CPU-only dataset loading.
 
 ## Dependencies
 
-Core dependencies are expected to include:
+Core dependencies:
 
 ```text
 torch
 torchaudio
 einops
 accelerate
+transformers
+librosa
 numpy
+pyyaml
 tqdm
 soundfile
+matplotlib
 ```
 
-Useful optional dependencies:
+Optional development dependencies:
 
 ```text
-auraloss
-tensorboard
-wandb
-matplotlib
 pytest
+wandb
 ```
 
-The exact dependency list should be captured in a `requirements.txt`, `environment.yml`, or `pyproject.toml` once the training stack is finalized.
-
-## Training
-
-The training entrypoint should eventually support configuration-driven runs, for example:
-
-```bash
-python train.py --config configs/encodec.yaml
-```
-
-For distributed training, the project can use either Hugging Face Accelerate or native PyTorch distributed launch. The final choice should be reflected in the training scripts and configuration files.
-
-## Evaluation
-
-Evaluation should include both objective and subjective checks:
-
-- Reconstruction loss on held-out audio.
-- Spectral loss on held-out audio.
-- Codebook usage statistics.
-- Reconstructed audio samples.
-- Compression bitrate for a chosen number of quantizers.
-
-Listening tests matter for this project. Low loss does not always mean the reconstructed audio sounds good.
+No dependency lockfile is checked in yet. Capture the final environment in a
+`requirements.txt`, `environment.yml`, or `pyproject.toml` once the training
+stack is stable.
 
 ## References
 
