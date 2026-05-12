@@ -3,18 +3,23 @@ import shutil
 from pathlib import Path
 import librosa
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 import accelerate
 from accelerate import Accelerator
-import argparse 
 import random
 from tqdm import tqdm
 from transformers import get_cosine_schedule_with_warmup
 
 from dataset import AudioDataset
 from loss import generator_loss, discriminator_loss
+from observability import (
+    build_dataset_report,
+    make_json_safe,
+    save_reconstruction_spectrogram,
+    save_run_snapshot,
+    write_json,
+)
 from utils import load_audios, save_audios
 from balancer import Balancer
 
@@ -34,7 +39,7 @@ class EncodecTrainer:
         ### EXPERIMENT SETUP ###
         self.experiment_name = training_config.get("experiment_name", "EnCodecTrainer")
         self.run_name = training_config.get("run_name", None)
-        self.working_directory = training_config.get("working_directory", "work_dir")
+        self.working_directory = training_config.get("working_directory", "dir")
 
         ### DATA SOURCE SETUP ###
         self.path_to_audio_dir = training_config.get("path_to_audio_dir", None)
@@ -61,7 +66,10 @@ class EncodecTrainer:
         ### LOGGING SETUP ###
         self.console_out_iters = training_config.get("console_out_iters", 5)
         self.log_wandb = training_config.get("log_wandb", False)
-        self.wandb_log_iters = training_config.get("wandb_log_iters", 5)
+        self.wandb_log_iters = training_config.get("wandb_log_iters", training_config.get("wand_log_iters", 5))
+        self.dataset_report_max_files = training_config.get("dataset_report_max_files", 2000)
+        self.log_reconstructions_to_wandb = training_config.get("log_reconstructions_to_wandb", True)
+        self.save_reconstruction_spectrograms = training_config.get("save_reconstruction_spectrograms", True)
         
         ### OPTIMIZER SETUP ###
         self.learning_rate = training_config.get("learning_rate", 1e-4)
@@ -83,22 +91,36 @@ class EncodecTrainer:
 
         ### Seed ###
         self.seed = training_config.get("seed", None)
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
 
         ### Prepare Accelerator ###
         self.path_to_experiment = self._get_path_to_experiment()
         os.makedirs(self.path_to_experiment, exist_ok=True)
         self.accelerator = Accelerator(project_dir=self.path_to_experiment, 
                                        log_with="wandb" if self.log_wandb else None)
+
+        self.run_config = {
+            "training_config": training_config,
+            "generator_config": generator.config,
+            "discriminator_config": discriminator.config if discriminator is not None else {},
+        }
+        if self.accelerator.is_main_process:
+            save_run_snapshot(self.path_to_experiment, self.run_config)
+        self.accelerator.wait_for_everyone()
+
         if self.log_wandb: 
             init_kwargs = {}
             if self.run_name is not None:
                 init_kwargs = {"wandb": {"name": self.run_name}}
             
-            run_config = {"training_config": training_config, 
-                          "generator_config": generator.config,
-                          "discriminator_config": discriminator.config if discriminator is not None else {}}
-            
-            self.accelerator.init_trackers(self.experiment_name, config=run_config, init_kwargs=init_kwargs)
+            self.accelerator.init_trackers(
+                self.experiment_name,
+                config=make_json_safe(self.run_config),
+                init_kwargs=init_kwargs,
+            )
 
         ### Store ###
         self.generator = generator
@@ -183,6 +205,18 @@ class EncodecTrainer:
         self._write_list_to_text(self.train_files, os.path.join(self.path_to_experiment, "train.txt"))
         self._write_list_to_text(self.test_files, os.path.join(self.path_to_experiment, "test.txt"))
 
+        if self.accelerator.is_main_process:
+            report = build_dataset_report(
+                self.train_files,
+                self.test_files,
+                sampling_rate=self.sampling_rate,
+                segment_length=self.segment_length,
+                max_audio_files=self.dataset_report_max_files,
+                seed=self.seed,
+            )
+            write_json(os.path.join(self.path_to_experiment, "dataset_report.json"), report)
+        self.accelerator.wait_for_everyone()
+
         ### Create our Datasets ###
         trainset = AudioDataset(audio_paths=self.train_files, 
                                 segment_length=self.segment_length, 
@@ -192,6 +226,53 @@ class EncodecTrainer:
                                sample_rate=self.sampling_rate)
         
         return trainset, testset
+
+    def _grad_norm(self, parameters):
+        norms = []
+        for param in parameters:
+            if param.grad is not None:
+                norms.append(param.grad.detach().float().norm(2))
+        if not norms:
+            return 0.0
+        return torch.stack(norms).norm(2).item()
+
+    def _quantizer_metrics(self, output):
+        unwrapped_model = self.accelerator.unwrap_model(self.generator)
+        metrics = unwrapped_model.quantizer.codebook_metrics()
+        metrics["quantizer/num_books_to_use"] = int(output["num_books_to_use"].detach().item())
+        losses = output.get("quantizer_losses")
+        if losses is not None:
+            for idx, loss in enumerate(losses.detach().flatten()):
+                metrics[f"quantizer/q{idx}_commitment_loss"] = loss.item()
+        return metrics
+
+    def _log_reconstruction_artifacts(self, cached_audios, gens, completed_steps, path_to_save_dir):
+        if not self.log_wandb or not self.log_reconstructions_to_wandb:
+            return
+
+        import wandb
+
+        log_dict = {}
+        for idx, (source, gen) in enumerate(zip(cached_audios, gens)):
+            source_audio = source.squeeze().detach().cpu().float().numpy()
+            gen_audio = gen.squeeze().detach().cpu().float().numpy()
+            log_dict[f"reconstructions/sample_{idx}/source_audio"] = wandb.Audio(
+                source_audio,
+                sample_rate=self.sampling_rate,
+                caption=f"source_{idx}",
+            )
+            log_dict[f"reconstructions/sample_{idx}/generated_audio"] = wandb.Audio(
+                gen_audio,
+                sample_rate=self.sampling_rate,
+                caption=f"generated_{idx}_step_{completed_steps}",
+            )
+
+            if self.save_reconstruction_spectrograms:
+                spec_path = os.path.join(path_to_save_dir, f"spec_{idx}.png")
+                save_reconstruction_spectrogram(spec_path, source, gen, self.sampling_rate)
+                log_dict[f"reconstructions/sample_{idx}/spectrogram"] = wandb.Image(spec_path)
+
+        self.accelerator.log(log_dict, step=completed_steps)
 
     def count_params(self, model):
 
@@ -248,7 +329,8 @@ class EncodecTrainer:
         
         ### Load Cached Audios for Inference ###
         if not resume:
-            sampled_paths = random.sample(testset.audio_paths, k=self.num_samples_for_reconstruction)
+            num_samples = min(self.num_samples_for_reconstruction, len(testset.audio_paths))
+            sampled_paths = random.sample(testset.audio_paths, k=num_samples)
             self._write_list_to_text(sampled_paths, os.path.join(self.path_to_experiment, "samples.txt"))
             path_to_save_inputs = os.path.join(self.path_to_experiment, "gen_inputs")
             os.makedirs(path_to_save_inputs, exist_ok=True)
@@ -271,11 +353,19 @@ class EncodecTrainer:
         cached_audios = load_audios(sampled_paths, self.sampling_rate)
 
         ### Load Optimizers ###
-        optimizer = torch.optim.Adam([p for p in self.generator.parameters() if p.requires_grad], lr=self.learning_rate)
+        optimizer = torch.optim.Adam(
+            [p for p in self.generator.parameters() if p.requires_grad],
+            lr=self.learning_rate,
+            betas=(self.beta1, self.beta2),
+        )
         
         disc_optimizer = None
         if self.discriminator is not None:
-            disc_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.disc_learning_rate)
+            disc_optimizer = torch.optim.Adam(
+                self.discriminator.parameters(),
+                lr=self.disc_learning_rate,
+                betas=(self.beta1, self.beta2),
+            )
 
         ### Load Scheduler ###
         scheduler = get_cosine_schedule_with_warmup(
@@ -406,6 +496,8 @@ class EncodecTrainer:
                     ### as this only effects the encoder portion of the model ###
                     ### https://github.com/facebookresearch/encodec/issues/20
                     self.accelerator.backward(self.quantizer_loss_lambda * output["quantizer_loss"])
+
+                gen_grad_norm = self._grad_norm(self.generator.parameters())
                 
                 ### Graient Clipping ###
                 if self.max_grad_norm is not None:
@@ -431,6 +523,8 @@ class EncodecTrainer:
                     train_feat_loss = losses["feature_loss"].item()
                     train_commit_loss = output["quantizer_loss"].item()
 
+                disc_loss = "N/A"
+                disc_grad_norm = 0.0
                 if self.discriminator is not None:
                     ###########################
                     ### Dimscriminator Step ###
@@ -453,6 +547,7 @@ class EncodecTrainer:
 
                         ### Update Disc ###
                         self.accelerator.backward(disc_loss)
+                        disc_grad_norm = self._grad_norm(self.discriminator.parameters())
 
                         ### Grad Clipping ###
                         if self.max_grad_norm is not None:
@@ -501,13 +596,24 @@ class EncodecTrainer:
                         "gen_loss": train_gen_loss, 
                         "feat_loss": train_feat_loss, 
                         "quant": train_commit_loss,
-                        "lr": scheduler.get_last_lr()[0]
+                        "lr": scheduler.get_last_lr()[0],
+                        "grad_norm/generator": gen_grad_norm,
+                        "train/time_loss": train_time_loss,
+                        "train/freq_loss": train_freq_loss,
+                        "train/gen_loss": train_gen_loss,
+                        "train/feat_loss": train_feat_loss,
+                        "train/quantizer_loss": train_commit_loss,
+                        "train/num_books_to_use": int(output["num_books_to_use"].detach().item()),
                     }
+
+                    log_dict.update(self._quantizer_metrics(output))
 
                     if self.discriminator is not None:
                         log_dict["disc_lr"] = disc_scheduler.get_last_lr()[0]
+                        log_dict["grad_norm/discriminator"] = disc_grad_norm
                         if not isinstance(disc_loss, str):
-                            log_dict["disc_loss"] = disc_loss
+                            log_dict["disc_loss"] = disc_loss.item()
+                            log_dict["train/disc_loss"] = disc_loss.item()
 
                     self.accelerator.log(log_dict, step=completed_steps)
 
@@ -564,7 +670,12 @@ class EncodecTrainer:
 
                     if self.log_wandb:
                         self.accelerator.log(
-                                {"test_time_loss": train_time_loss, "test_freq_loss": train_freq_loss},
+                                {
+                                    "test_time_loss": test_time_loss,
+                                    "test_freq_loss": test_freq_loss,
+                                    "validation/time_loss": test_time_loss,
+                                    "validation/freq_loss": test_freq_loss,
+                                },
                                 step=completed_steps
                             )
                     
@@ -589,6 +700,15 @@ class EncodecTrainer:
                         os.makedirs(path_to_save_dir, exist_ok=True)
                         path_to_saves = [os.path.join(path_to_save_dir, file) for file in [f"gen_{i}.wav" for i in range(len(gens))]]
                         save_audios(gens, path_to_saves, self.sampling_rate)
+                        if self.save_reconstruction_spectrograms and not self.log_wandb:
+                            for i, (source, gen) in enumerate(zip(cached_audios, gens)):
+                                save_reconstruction_spectrogram(
+                                    os.path.join(path_to_save_dir, f"spec_{i}.png"),
+                                    source,
+                                    gen,
+                                    self.sampling_rate,
+                                )
+                        self._log_reconstruction_artifacts(cached_audios, gens, completed_steps, path_to_save_dir)
 
                     self.accelerator.wait_for_everyone()
 

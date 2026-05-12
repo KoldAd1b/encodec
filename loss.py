@@ -13,13 +13,14 @@ class Audio2Mel(nn.Module):
         n_mel_channels=80,
         mel_fmin=0.0,
         mel_fmax=None,
-        device='cuda'
+        device=None
     ):
         super().__init__()
 
+        device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         window = torch.hann_window(win_length, device=device).float()
         mel_basis = librosa_mel_fn(sr=sampling_rate,n_fft=n_fft,n_mels=n_mel_channels,fmin=mel_fmin,fmax=mel_fmax)
-        mel_basis = torch.from_numpy(mel_basis).cuda().float()
+        mel_basis = torch.from_numpy(mel_basis).to(device=device).float()
 
         self.register_buffer("mel_basis", mel_basis)
         self.register_buffer("window", window)
@@ -82,7 +83,7 @@ def generator_loss(
         hop_size = window_size // 4
         fft = Audio2Mel(n_fft=window_size, win_length=window_size, 
                         hop_length=hop_size, sampling_rate=sample_rate,
-                        n_mel_channels=num_mels)
+                        n_mel_channels=num_mels, device=input_wav.device)
         input_mel = fft(input_wav)
         output_mel = fft(output_wav)
 

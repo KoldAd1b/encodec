@@ -33,7 +33,10 @@ training_config:
   ### Logging Setup ###
   console_out_iters: 5
   log_wandb: True
-  wand_log_iters: 5
+  wandb_log_iters: 5
+  dataset_report_max_files: 2000
+  log_reconstructions_to_wandb: True
+  save_reconstruction_spectrograms: True
 
   ### Optimizer Setup ###
   learning_rate: 0.0003

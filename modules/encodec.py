@@ -119,7 +119,7 @@ class EncodecModel(nn.Module):
         if self._is_distributed():
             num_books_to_use = accelerate.utils.broadcast(num_books_to_use, from_process=0)
         
-        quantized_out, _, out_losses = self.quantizer(encoded, num_books_to_use)
+        quantized_out, codebook_indices, out_losses = self.quantizer(encoded, num_books_to_use)
         decoded = self.decoder(quantized_out)
 
         decoded = self.denormalize(decoded, scale)
@@ -127,7 +127,10 @@ class EncodecModel(nn.Module):
 
         return {"encoder_out": encoded, 
                 "quantized": quantized_out, 
-                "quantizer_loss": torch.mean(out_losses), 
+                "quantizer_loss": torch.mean(out_losses),
+                "quantizer_losses": out_losses,
+                "codebook_indices": codebook_indices,
+                "num_books_to_use": num_books_to_use,
                 "decoded": decoded}
 
     @torch.no_grad()

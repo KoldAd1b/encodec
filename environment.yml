@@ -1,0 +1,23 @@
+name: audio-brr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - pip
+  - pip:
+      - accelerate
+      - einops
+      - librosa
+      - matplotlib
+      - numpy
+      - pytest
+      - pyyaml
+      - soundfile
+      - torch
+      - torchaudio
+      - torchcodec
+      - tqdm
+      - transformers
+      - triton
+      - wandb

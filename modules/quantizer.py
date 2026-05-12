@@ -369,6 +369,48 @@ class ResidualVectorQuantization(nn.Module):
         
         return quantized_out, out_indices, out_losses
 
+    @torch.no_grad()
+    def codebook_metrics(self, prefix="quantizer"):
+        metrics = {}
+        active_counts = []
+        dead_counts = []
+        perplexities = []
+
+        for idx, layer in enumerate(self.layers):
+            codebook = layer._codebook
+            cluster_size = codebook.cluster_size.detach().float()
+            total = cluster_size.sum()
+            active_mask = cluster_size >= codebook.threshold_ema_dead_code
+            dead_mask = cluster_size < codebook.threshold_ema_dead_code
+
+            if total > 0:
+                probs = cluster_size / total.clamp_min(1e-12)
+                entropy = -(probs * probs.clamp_min(1e-12).log()).sum()
+                perplexity = entropy.exp()
+            else:
+                entropy = torch.tensor(0.0, device=cluster_size.device)
+                perplexity = torch.tensor(0.0, device=cluster_size.device)
+
+            active = active_mask.sum()
+            dead = dead_mask.sum()
+            active_counts.append(active.float())
+            dead_counts.append(dead.float())
+            perplexities.append(perplexity.float())
+
+            metrics[f"{prefix}/q{idx}_active_codes"] = active.item()
+            metrics[f"{prefix}/q{idx}_dead_codes"] = dead.item()
+            metrics[f"{prefix}/q{idx}_perplexity"] = perplexity.item()
+            metrics[f"{prefix}/q{idx}_entropy"] = entropy.item()
+            metrics[f"{prefix}/q{idx}_cluster_size_max"] = cluster_size.max().item()
+            metrics[f"{prefix}/q{idx}_cluster_size_mean"] = cluster_size.mean().item()
+
+        if active_counts:
+            metrics[f"{prefix}/active_codes_mean"] = torch.stack(active_counts).mean().item()
+            metrics[f"{prefix}/dead_codes_mean"] = torch.stack(dead_counts).mean().item()
+            metrics[f"{prefix}/perplexity_mean"] = torch.stack(perplexities).mean().item()
+
+        return metrics
+
 def test_kmeans():
     import matplotlib.pyplot as plt
 
