@@ -37,9 +37,11 @@ def kmeans(samples, num_clusters, num_iters):
 
     for _ in range(num_iters):
 
-        samples_, means_ = samples.unsqueeze(1), means.unsqueeze(0)
-        diffs = samples_ - means_
-        dists = -1 * (diffs ** 2).sum(dim=-1)
+        dists = -(
+            samples.pow(2).sum(1, keepdim=True)
+            - 2 * samples @ means.t()
+            + means.pow(2).sum(1, keepdim=True).t()
+        )
 
         buckets = dists.max(dim=-1).indices
         bins = torch.bincount(buckets, minlength=num_clusters)
