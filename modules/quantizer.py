@@ -89,6 +89,9 @@ class EuclideanCodebook(nn.Module):
     def _is_distributed(self):
         return self.accelerator is not None and self.accelerator.num_processes > 1
 
+    def set_accelerator(self, accelerator):
+        self.accelerator = accelerator
+
     def _broadcast_buffers(self):
         if not self._is_distributed():
             return
@@ -273,6 +276,10 @@ class VectorQuantization(nn.Module):
                                            decay=decay, epsilon=epsilon, 
                                            threashold_ema_dead_code=threshold_ema_dead_code, 
                                            accelerator=accelerator)
+
+    def set_accelerator(self, accelerator):
+        self.accelerator = accelerator
+        self._codebook.set_accelerator(accelerator)
     
     @torch.no_grad()
     def encode(self, x):
@@ -318,12 +325,27 @@ class ResidualVectorQuantization(nn.Module):
             [VectorQuantization(**kwargs) for _ in range(num_quantizers)]
         )
 
+    def set_accelerator(self, accelerator):
+        for layer in self.layers:
+            layer.set_accelerator(accelerator)
+
+    def _normalize_n_q(self, n_q):
+        if n_q is None:
+            return len(self.layers)
+        if isinstance(n_q, torch.Tensor):
+            n_q = int(n_q.detach().item())
+        else:
+            n_q = int(n_q)
+        if n_q < 1 or n_q > len(self.layers):
+            raise ValueError(f"n_q must be in [1, {len(self.layers)}], got {n_q}")
+        return n_q
+
     @torch.no_grad()
     def encode(self, x, n_q=None):
         
         residual = x
         all_indices = []
-        n_q = n_q or len(self.layers)
+        n_q = self._normalize_n_q(n_q)
         
         for layer in self.layers[:n_q]:
             indices = layer.encode(residual)
@@ -353,7 +375,7 @@ class ResidualVectorQuantization(nn.Module):
         all_losses = []
         all_indices = []
 
-        n_q = n_q or len(self.layers)
+        n_q = self._normalize_n_q(n_q)
 
         for layer in self.layers[:n_q]:
 

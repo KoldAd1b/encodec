@@ -84,6 +84,10 @@ class EncodecModel(nn.Module):
     def _is_distributed(self):
         return self.accelerator is not None and self.accelerator.num_processes > 1
 
+    def set_accelerator(self, accelerator):
+        self.accelerator = accelerator
+        self.quantizer.set_accelerator(accelerator)
+
     def normalize(self, x):
 
         """
@@ -107,14 +111,16 @@ class EncodecModel(nn.Module):
     def denormalize(self, x, scale):
         return x * scale
 
-    def forward(self, x):
+    def forward(self, x, num_books_to_use=None):
 
         batch_size, channels, seq_len = x.shape
 
         x, scale = self.normalize(x)
         encoded = self.encoder(x)
 
-        num_books_to_use = torch.tensor(random.randint(0, self.num_quantizers), device=x.device)
+        if num_books_to_use is None:
+            num_books_to_use = random.randint(1, self.num_quantizers)
+        num_books_to_use = torch.as_tensor(num_books_to_use, device=x.device, dtype=torch.long)
 
         if self._is_distributed():
             num_books_to_use = accelerate.utils.broadcast(num_books_to_use, from_process=0)

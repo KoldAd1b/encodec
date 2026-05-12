@@ -29,8 +29,8 @@ def load_audio(path_to_audio, sr):
 
 def main():
     
-    PATH_TO_CONFIG = "configs/config.yaml"
-    PATH_TO_WEIGHTS = "dir/EnCodecTrainerLibriTTSLocal/final_checkpoint/pytorch_model.bin"
+    PATH_TO_CONFIG = "config/config.yaml"
+    PATH_TO_WEIGHTS = "dir/EnCodecTrainerLibriTTS/final_checkpoint/pytorch_model.bin"
 
     with open("data/test.txt", "r") as f:
         audio_files = f.readlines()

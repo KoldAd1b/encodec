@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from librosa.filters import mel as librosa_mel_fn
 
+_MEL_TRANSFORM_CACHE = {}
+
 class Audio2Mel(nn.Module):
     def __init__(
         self,
@@ -63,6 +65,28 @@ class Audio2Mel(nn.Module):
             log_mel_spec = log_mel_spec.reshape(shape[0], shape[1], -1)
 
         return log_mel_spec
+
+
+def get_mel_transforms(sample_rate, num_mels, device):
+    key = (str(device), sample_rate, num_mels)
+    transforms = _MEL_TRANSFORM_CACHE.get(key)
+    if transforms is None:
+        transforms = []
+        for i in range(5, 12):
+            window_size = 2 ** i
+            hop_size = window_size // 4
+            transforms.append(
+                Audio2Mel(
+                    n_fft=window_size,
+                    win_length=window_size,
+                    hop_length=hop_size,
+                    sampling_rate=sample_rate,
+                    n_mel_channels=num_mels,
+                    device=device,
+                ).to(device)
+            )
+        _MEL_TRANSFORM_CACHE[key] = transforms
+    return transforms
     
 def generator_loss(
         fmap_real, # list[list[tensor]] -> K discriminators, L layers each
@@ -78,12 +102,7 @@ def generator_loss(
      
     #  Frequency domain loss
     frequency_loss = 0.0
-    for i in range(5,12): # 2**5 -> 2**11 : 32 -> 2048
-        window_size = 2 ** i
-        hop_size = window_size // 4
-        fft = Audio2Mel(n_fft=window_size, win_length=window_size, 
-                        hop_length=hop_size, sampling_rate=sample_rate,
-                        n_mel_channels=num_mels, device=input_wav.device)
+    for fft in get_mel_transforms(sample_rate, num_mels, input_wav.device):
         input_mel = fft(input_wav)
         output_mel = fft(output_wav)
 

@@ -13,6 +13,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--path_to_config", default="config/config.yaml")
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     config = load_yaml(args.path_to_config)
@@ -44,7 +45,7 @@ def main():
     trainer = EncodecTrainer(generator=encodec, 
                              discriminator=discriminator, 
                              training_config=training_config)
-    trainer.train()
+    trainer.train(resume=args.resume)
 
 if __name__ == "__main__":
     main()

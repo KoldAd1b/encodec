@@ -1,0 +1,11 @@
+/example
+
+/papers
+.gitignore
+/AGENTS.md
+/data
+.vscode/
+__pycache__/
+*.pyc
+dir/
+sample/

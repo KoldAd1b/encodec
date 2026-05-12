@@ -58,6 +58,7 @@ class EncodecTrainer:
         self.checkpoint_iterations = training_config.get("checkpoint_iterations", 25000)
         self.eval_iterations = training_config.get("eval_iterations", 2500)
         self.generation_iterations = training_config.get("generation_iterations", 2500)
+        self.max_eval_batches = training_config.get("max_eval_batches", None)
         self.per_gpu_batch_size = training_config.get("per_gpu_batch_size", 16)
         self.num_workers = training_config.get("num_workers", 16)
         self.pin_memory = training_config.get("pin_memory", False)
@@ -101,6 +102,8 @@ class EncodecTrainer:
         os.makedirs(self.path_to_experiment, exist_ok=True)
         self.accelerator = Accelerator(project_dir=self.path_to_experiment, 
                                        log_with="wandb" if self.log_wandb else None)
+        if hasattr(generator, "set_accelerator"):
+            generator.set_accelerator(self.accelerator)
 
         self.run_config = {
             "training_config": training_config,
@@ -370,16 +373,16 @@ class EncodecTrainer:
         ### Load Scheduler ###
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
-            num_warmup_steps=self.warmup_iterations * self.accelerator.num_processes, 
-            num_training_steps=self.total_iterations * self.accelerator.num_processes
+            num_warmup_steps=self.warmup_iterations, 
+            num_training_steps=self.total_iterations
         )
     
         disc_scheduler = None
         if self.discriminator is not None:
             disc_scheduler = get_cosine_schedule_with_warmup(
                 disc_optimizer, 
-                num_warmup_steps=self.warmup_iterations * self.accelerator.num_processes, 
-                num_training_steps=self.total_iterations * self.accelerator.num_processes
+                num_warmup_steps=self.warmup_iterations, 
+                num_training_steps=self.total_iterations
             )
 
         ### Prepare Everything ###
@@ -555,12 +558,12 @@ class EncodecTrainer:
 
                         ### Update Discriminator ###
                         disc_optimizer.step()
+
+                        ### Update Disc Scheduler after an actual discriminator update ###
+                        disc_scheduler.step()
                     
                     else:
                         disc_loss = "skipped"
-                    
-                    ### Update Disc Scheduler anyway even if we skipped ###
-                    disc_scheduler.step()
 
                 ### Completed 1 Step of Training ###
                 completed_steps += 1
@@ -626,12 +629,16 @@ class EncodecTrainer:
                     if self.discriminator is not None:
                         self.discriminator.eval()
 
-                    for waveforms in tqdm(testloader, disable=not self.accelerator.is_main_process):
+                    for eval_batch_idx, waveforms in enumerate(tqdm(testloader, disable=not self.accelerator.is_main_process)):
+                        if self.max_eval_batches is not None and eval_batch_idx >= self.max_eval_batches:
+                            break
+
+                        waveforms = waveforms.to(self.accelerator.device)
                         
                         with torch.no_grad():
 
                             ### Pass through generator ###
-                            output = self.generator(waveforms)
+                            output = self.generator(waveforms, num_books_to_use=self.accelerator.unwrap_model(self.generator).num_quantizers)
 
                             ### pass real and fake into disc ###
                             if self.discriminator is not None:
@@ -730,3 +737,4 @@ class EncodecTrainer:
         
         output_dir = os.path.join(self.path_to_experiment, f"final_checkpoint")
         self.accelerator.save_state(output_dir, safe_serialization=False)
+        self.accelerator.end_training()

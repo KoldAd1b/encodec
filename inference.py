@@ -64,8 +64,8 @@ def plot_mel_comparison(original, reconstruction, sr):
 
 if __name__ == "__main__":
 
-    PATH_TO_CONFIG = "configs/config.yaml"
-    PATH_TO_WEIGHTS = "work_dir/EnCodecTrainerLibriTTSLocal/final_checkpoint/pytorch_model.bin"
+    PATH_TO_CONFIG = "config/config.yaml"
+    PATH_TO_WEIGHTS = "dir/EnCodecTrainerLibriTTS/final_checkpoint/pytorch_model.bin"
     PATH_TO_AUDIO = "ood_samples/french_sample.mp3"
     config = load_yaml(PATH_TO_CONFIG)
 
