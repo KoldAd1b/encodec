@@ -1,5 +1,6 @@
 import os
 import shutil
+import json
 from pathlib import Path
 import librosa
 import torch
@@ -63,6 +64,9 @@ class EncodecTrainer:
         self.num_workers = training_config.get("num_workers", 16)
         self.pin_memory = training_config.get("pin_memory", False)
         self.max_grad_norm = training_config.get("max_grad_norm", None)
+        self.skip_anomalous_batches = training_config.get("skip_anomalous_batches", False)
+        self.anomaly_quantizer_loss_threshold = training_config.get("anomaly_quantizer_loss_threshold", 1e6)
+        self.anomaly_log_path = training_config.get("anomaly_log_path", "anomaly_batches.jsonl")
 
         ### LOGGING SETUP ###
         self.console_out_iters = training_config.get("console_out_iters", 5)
@@ -231,7 +235,8 @@ class EncodecTrainer:
         ### Create our Datasets ###
         trainset = AudioDataset(audio_paths=self.train_files, 
                                 segment_length=self.segment_length, 
-                                sample_rate=self.sampling_rate)
+                                sample_rate=self.sampling_rate,
+                                return_path=self.skip_anomalous_batches)
         testset = AudioDataset(audio_paths=self.test_files, 
                                segment_length=self.segment_length, 
                                sample_rate=self.sampling_rate)
@@ -321,6 +326,69 @@ class EncodecTrainer:
             for idx, loss in enumerate(losses.detach().flatten()):
                 metrics[f"quantizer/q{idx}_commitment_loss"] = loss.item()
         return metrics
+
+    def _capture_quantizer_buffers(self):
+        unwrapped_model = self.accelerator.unwrap_model(self.generator)
+        return [
+            {
+                name: buffer.detach().clone()
+                for name, buffer in layer._codebook.named_buffers()
+            }
+            for layer in unwrapped_model.quantizer.layers
+        ]
+
+    def _restore_quantizer_buffers(self, states):
+        if states is None:
+            return
+
+        unwrapped_model = self.accelerator.unwrap_model(self.generator)
+        for layer, layer_state in zip(unwrapped_model.quantizer.layers, states):
+            buffers = dict(layer._codebook.named_buffers())
+            for name, value in layer_state.items():
+                buffers[name].data.copy_(value)
+
+    def _unpack_batch(self, batch):
+        if isinstance(batch, (tuple, list)) and len(batch) == 2 and torch.is_tensor(batch[0]):
+            paths = list(batch[1])
+            return batch[0], paths
+        return batch, None
+
+    def _write_anomaly_record(self, completed_steps, batch_paths, waveforms, losses, output, local_anomaly):
+        path = os.path.join(self.path_to_experiment, self.anomaly_log_path)
+        waveforms_for_stats = waveforms.detach().float()
+        rms = waveforms_for_stats.pow(2).mean(dim=(1, 2)).sqrt().cpu().tolist()
+        peak = waveforms_for_stats.abs().amax(dim=(1, 2)).cpu().tolist()
+        record = {
+            "step_candidate": completed_steps + 1,
+            "process_index": self.accelerator.process_index,
+            "local_anomaly": bool(local_anomaly),
+            "paths": batch_paths,
+            "waveform_rms": rms,
+            "waveform_peak": peak,
+            "losses": {
+                "time_loss": float(losses["time_loss"].detach().item()),
+                "frequency_loss": float(losses["frequency_loss"].detach().item()),
+                "generator_loss": float(losses["generator_loss"].detach().item()),
+                "feature_loss": float(losses["feature_loss"].detach().item()),
+                "quantizer_loss": float(output["quantizer_loss"].detach().item()),
+            },
+            "num_books_to_use": int(output["num_books_to_use"].detach().item()),
+        }
+
+        with open(path, "a") as f:
+            f.write(json.dumps(make_json_safe(record)) + "\n")
+
+    def _is_anomalous_batch(self, losses, output):
+        values = torch.stack([
+            losses["time_loss"].detach().float(),
+            losses["frequency_loss"].detach().float(),
+            losses["generator_loss"].detach().float(),
+            losses["feature_loss"].detach().float(),
+            output["quantizer_loss"].detach().float(),
+        ])
+        finite = torch.isfinite(values).all()
+        too_large = output["quantizer_loss"].detach().float() > float(self.anomaly_quantizer_loss_threshold)
+        return (~finite) | too_large
 
     def _log_reconstruction_artifacts(self, cached_audios, gens, completed_steps, path_to_save_dir):
         if not self.log_wandb or not self.log_reconstructions_to_wandb:
@@ -516,17 +584,21 @@ class EncodecTrainer:
         train = True
         while train:
 
-            for waveforms in trainloader:
+            for batch in trainloader:
                 
                 ### Move to GPU ###
+                waveforms, batch_paths = self._unpack_batch(batch)
                 waveforms = waveforms.to(self.accelerator.device)
 
                 ######################
                 ### Generator Step ###
                 ######################
                 optimizer.zero_grad(set_to_none=True)
+                if self.discriminator is not None:
+                    disc_optimizer.zero_grad(set_to_none=True)
                 
                 ### Get output ###
+                quantizer_state = self._capture_quantizer_buffers() if self.skip_anomalous_batches else None
                 output = self.generator(waveforms)
 
                 ### pass real and fake into disc ###
@@ -542,6 +614,28 @@ class EncodecTrainer:
                     sample_rate=self.sampling_rate, 
                     num_mels=self.num_mels
                 )
+
+                if self.skip_anomalous_batches:
+                    local_anomaly = self._is_anomalous_batch(losses, output)
+                    global_anomaly = self.accelerator.reduce(local_anomaly.float(), reduction="max")
+                    if global_anomaly.item() > 0:
+                        self._restore_quantizer_buffers(quantizer_state)
+                        self._write_anomaly_record(
+                            completed_steps,
+                            batch_paths,
+                            waveforms,
+                            losses,
+                            output,
+                            local_anomaly.item() > 0,
+                        )
+                        self.accelerator.wait_for_everyone()
+                        if self.accelerator.is_main_process:
+                            self.accelerator.print(
+                                "Skipped anomalous batch before optimizer step at "
+                                f"step_candidate={completed_steps + 1}; "
+                                f"threshold={self.anomaly_quantizer_loss_threshold:.2e}"
+                            )
+                        continue
 
                 ### Standard backward pass without the balancer ###
                 if not self.use_balancer:
@@ -597,8 +691,6 @@ class EncodecTrainer:
                     ###########################
                     ### Dimscriminator Step ###
                     ###########################
-
-                    disc_optimizer.zero_grad(set_to_none=True)
 
                     ### Random sample value between 0 and 1 ###
                     ### Ensure all GPUs have the same value ###

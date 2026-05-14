@@ -16,10 +16,12 @@ class AudioDataset(Dataset):
                  path_to_txt=None, 
                  audio_paths=None,
                  segment_length=24000, 
-                 sample_rate=24000):
+                 sample_rate=24000,
+                 return_path=False):
 
         self.segment_length = segment_length
         self.sample_rate = sample_rate
+        self.return_path = return_path
         
         # Read all audio file paths from the text file
         if audio_paths is None:
@@ -58,5 +60,8 @@ class AudioDataset(Dataset):
             # Pad if audio is shorter than segment_length
             padding = self.segment_length - audio_length
             waveform = torch.nn.functional.pad(waveform, (0, padding), mode='constant', value=0)
+
+        if self.return_path:
+            return waveform, audio_path
 
         return waveform
