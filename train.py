@@ -262,6 +262,47 @@ class EncodecTrainer:
         self.accelerator.wait_for_everyone()
         return payload[0]
 
+    def _raw_scheduler(self, scheduler):
+        return getattr(scheduler, "scheduler", scheduler)
+
+    def _set_scheduler_step(self, scheduler, target_step):
+        if scheduler is None:
+            return None
+
+        raw_scheduler = self._raw_scheduler(scheduler)
+        target_step = max(int(target_step), 0)
+        lrs = [
+            base_lr * lr_lambda(target_step)
+            for base_lr, lr_lambda in zip(raw_scheduler.base_lrs, raw_scheduler.lr_lambdas)
+        ]
+
+        raw_scheduler.last_epoch = target_step
+        raw_scheduler._step_count = target_step + 1
+        raw_scheduler._last_lr = lrs
+        for param_group, base_lr, lr in zip(raw_scheduler.optimizer.param_groups, raw_scheduler.base_lrs, lrs):
+            param_group["lr"] = lr
+            param_group.setdefault("initial_lr", base_lr)
+        return lrs
+
+    def _correct_loaded_scheduler_states(self, scheduler, disc_scheduler, completed_steps):
+        generator_lrs = self._set_scheduler_step(scheduler, completed_steps)
+
+        disc_lrs = None
+        disc_step = None
+        if disc_scheduler is not None:
+            raw_disc_scheduler = self._raw_scheduler(disc_scheduler)
+            loaded_disc_step = int(getattr(raw_disc_scheduler, "last_epoch", 0))
+            disc_step = round(loaded_disc_step / max(self.accelerator.num_processes, 1))
+            disc_lrs = self._set_scheduler_step(disc_scheduler, disc_step)
+
+        gen_lr = generator_lrs[0] if generator_lrs else None
+        disc_lr = disc_lrs[0] if disc_lrs else None
+        self.accelerator.print(
+            "Corrected scheduler state: "
+            f"generator_step={completed_steps}, generator_lr={gen_lr}; "
+            f"disc_step={disc_step}, disc_lr={disc_lr}"
+        )
+
     def _grad_norm(self, parameters):
         norms = []
         for param in parameters:
@@ -340,7 +381,12 @@ class EncodecTrainer:
         self.accelerator.print(f"{'Starting From Iteration':<25}: {starting_iteration:>15}")
         self.accelerator.print("=" * 60)
 
-    def train(self, resume=False):
+    def train(
+            self,
+            resume=False,
+            resume_checkpoint=None,
+            correct_scheduler_state=False,
+            regenerate_samples=False):
 
         ### Load Datasets ###
         if not resume:
@@ -350,8 +396,11 @@ class EncodecTrainer:
         else:
 
             ### Replace the class variables for train/test manifests to the cached files ###
-            self.path_to_train_manifest = os.path.join(self.path_to_experiment, "train.txt")
-            self.path_to_val_manifest = os.path.join(self.path_to_experiment, "test.txt")
+            cached_train_manifest = os.path.join(self.path_to_experiment, "train.txt")
+            cached_test_manifest = os.path.join(self.path_to_experiment, "test.txt")
+            if os.path.exists(cached_train_manifest) and os.path.exists(cached_test_manifest):
+                self.path_to_train_manifest = cached_train_manifest
+                self.path_to_val_manifest = cached_test_manifest
             trainset, testset = self._get_datasets()
         
         ### Load Dataloader ###
@@ -363,7 +412,7 @@ class EncodecTrainer:
                                 pin_memory=self.pin_memory)
         
         ### Load Cached Audios for Inference ###
-        sampled_paths = self._select_reconstruction_samples(testset, resume)
+        sampled_paths = self._select_reconstruction_samples(testset, resume and not regenerate_samples)
         cached_audios = load_audios(sampled_paths, self.sampling_rate)
 
         ### Load Optimizers ###
@@ -436,11 +485,14 @@ class EncodecTrainer:
         
         ### Resume from Checkpoint ###
         if resume:
-            last_ckpt = max(
-                (d for d in os.listdir(self.path_to_experiment) if d.startswith("checkpoint_")), 
-                key=lambda x: int(x.split("_")[1]),
-            )
-            last_ckpt = os.path.join(self.path_to_experiment, last_ckpt)
+            if resume_checkpoint is None:
+                last_ckpt = max(
+                    (d for d in os.listdir(self.path_to_experiment) if d.startswith("checkpoint_")),
+                    key=lambda x: int(x.split("_")[1]),
+                )
+                last_ckpt = os.path.join(self.path_to_experiment, last_ckpt)
+            else:
+                last_ckpt = resume_checkpoint
             self.accelerator.print(f"Resuming From Checkpoint: {last_ckpt}")
             self.accelerator.load_state(last_ckpt)
 
@@ -450,6 +502,8 @@ class EncodecTrainer:
                 balancer.load_state(balancer_state)
             
             completed_steps = int(last_ckpt.split("_")[-1])
+            if correct_scheduler_state:
+                self._correct_loaded_scheduler_states(scheduler, disc_scheduler, completed_steps)
 
         else:
             completed_steps = 0

@@ -14,6 +14,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--path_to_config", default="config/config.yaml")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None)
+    parser.add_argument("--correct_scheduler_state", action="store_true")
+    parser.add_argument("--regenerate_samples", action="store_true")
     args = parser.parse_args()
 
     config = load_yaml(args.path_to_config)
@@ -45,7 +48,12 @@ def main():
     trainer = EncodecTrainer(generator=encodec, 
                              discriminator=discriminator, 
                              training_config=training_config)
-    trainer.train(resume=args.resume)
+    trainer.train(
+        resume=args.resume,
+        resume_checkpoint=args.resume_checkpoint,
+        correct_scheduler_state=args.correct_scheduler_state,
+        regenerate_samples=args.regenerate_samples,
+    )
 
 if __name__ == "__main__":
     main()
