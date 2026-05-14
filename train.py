@@ -298,7 +298,10 @@ class EncodecTrainer:
         if disc_scheduler is not None:
             raw_disc_scheduler = self._raw_scheduler(disc_scheduler)
             loaded_disc_step = int(getattr(raw_disc_scheduler, "last_epoch", 0))
-            disc_step = round(loaded_disc_step / max(self.accelerator.num_processes, 1))
+            if loaded_disc_step > completed_steps:
+                disc_step = round(loaded_disc_step / max(self.accelerator.num_processes, 1))
+            else:
+                disc_step = loaded_disc_step
             disc_lrs = self._set_scheduler_step(disc_scheduler, disc_step)
 
         gen_lr = generator_lrs[0] if generator_lrs else None
