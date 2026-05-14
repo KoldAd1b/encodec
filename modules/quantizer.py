@@ -133,11 +133,22 @@ class EuclideanCodebook(nn.Module):
             self.inited.data = accelerate.utils.broadcast(self.inited.data, from_process=0)
 
     def replace_(self, samples, mask):
-        
-        modified_codebook = torch.where(
-            mask.unsqueeze(-1), sample_vectors(samples, self.codebooks_size), self.embed
+        replacement = sample_vectors(samples, self.codebooks_size).to(self.embed.dtype)
+        replacement_count = torch.full_like(
+            self.cluster_size,
+            max(float(self.threshold_ema_dead_code), 1.0),
         )
+        cluster_size = torch.where(mask, replacement_count, self.cluster_size)
+        modified_codebook = torch.where(
+            mask.unsqueeze(-1), replacement, self.embed
+        )
+        modified_embed_avg = torch.where(
+            mask.unsqueeze(-1), replacement * cluster_size.unsqueeze(-1), self.embed_avg
+        )
+
+        self.cluster_size.data.copy_(cluster_size)
         self.embed.data.copy_(modified_codebook)
+        self.embed_avg.data.copy_(modified_embed_avg)
     
     def expire_codes_(self, batch_samples):
         if self.threshold_ema_dead_code == 0:
@@ -155,7 +166,7 @@ class EuclideanCodebook(nn.Module):
 
         if self._is_distributed():
             self.accelerator.wait_for_everyone()
-            self.embed.data = accelerate.utils.broadcast(self.embed.data, from_process=0)
+            self._broadcast_buffers()
 
     def preprocess(self, x):
         x = einops.rearrange(x, "... d -> (...) d")
