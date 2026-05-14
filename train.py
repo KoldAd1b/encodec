@@ -66,6 +66,7 @@ class EncodecTrainer:
         self.max_grad_norm = training_config.get("max_grad_norm", None)
         self.skip_anomalous_batches = training_config.get("skip_anomalous_batches", False)
         self.anomaly_quantizer_loss_threshold = training_config.get("anomaly_quantizer_loss_threshold", 1e6)
+        self.anomaly_encoder_norm_threshold = training_config.get("anomaly_encoder_norm_threshold", None)
         self.anomaly_log_path = training_config.get("anomaly_log_path", "anomaly_batches.jsonl")
 
         ### LOGGING SETUP ###
@@ -358,6 +359,7 @@ class EncodecTrainer:
         waveforms_for_stats = waveforms.detach().float()
         rms = waveforms_for_stats.pow(2).mean(dim=(1, 2)).sqrt().cpu().tolist()
         peak = waveforms_for_stats.abs().amax(dim=(1, 2)).cpu().tolist()
+        encoder_norms = output["encoder_out"].detach().float().norm(dim=1)
         record = {
             "step_candidate": completed_steps + 1,
             "process_index": self.accelerator.process_index,
@@ -365,6 +367,8 @@ class EncodecTrainer:
             "paths": batch_paths,
             "waveform_rms": rms,
             "waveform_peak": peak,
+            "encoder_norm_max": float(encoder_norms.amax().item()),
+            "encoder_norm_median": float(encoder_norms.median().item()),
             "losses": {
                 "time_loss": float(losses["time_loss"].detach().item()),
                 "frequency_loss": float(losses["frequency_loss"].detach().item()),
@@ -388,7 +392,12 @@ class EncodecTrainer:
         ])
         finite = torch.isfinite(values).all()
         too_large = output["quantizer_loss"].detach().float() > float(self.anomaly_quantizer_loss_threshold)
-        return (~finite) | too_large
+        encoder_norm_too_large = torch.tensor(False, device=values.device)
+        if self.anomaly_encoder_norm_threshold is not None:
+            encoder_norm = output["encoder_out"].detach().float().norm(dim=1).amax()
+            encoder_norm_too_large = encoder_norm > float(self.anomaly_encoder_norm_threshold)
+            finite = finite & torch.isfinite(encoder_norm)
+        return (~finite) | too_large | encoder_norm_too_large
 
     def _log_reconstruction_artifacts(self, cached_audios, gens, completed_steps, path_to_save_dir):
         if not self.log_wandb or not self.log_reconstructions_to_wandb:

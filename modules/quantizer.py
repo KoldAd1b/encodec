@@ -27,6 +27,28 @@ def sample_vectors(samples, num):
     
     return samples[indices]
 
+def filter_replacement_samples(samples, max_norm=100.0, median_norm_factor=10.0):
+    samples = einops.rearrange(samples, "... d -> (...) d")
+    finite_mask = torch.isfinite(samples).all(dim=-1)
+    samples = samples[finite_mask]
+    if samples.numel() == 0:
+        return torch.zeros(1, samples.shape[-1], device=samples.device, dtype=samples.dtype)
+
+    norms = samples.float().norm(dim=-1)
+    finite_norm_mask = torch.isfinite(norms)
+    samples = samples[finite_norm_mask]
+    norms = norms[finite_norm_mask]
+    if samples.numel() == 0:
+        return torch.zeros(1, samples.shape[-1], device=samples.device, dtype=samples.dtype)
+
+    norm_limit = norms.median() * median_norm_factor
+    norm_limit = torch.clamp(norm_limit, min=1.0, max=max_norm)
+    safe_mask = norms <= norm_limit
+    if torch.any(safe_mask):
+        return samples[safe_mask]
+
+    return samples[norms.argmin().unsqueeze(0)]
+
 def kmeans(samples, num_clusters, num_iters):
     """Initialize codebook embeddings with k-means."""
 
@@ -133,6 +155,7 @@ class EuclideanCodebook(nn.Module):
             self.inited.data = accelerate.utils.broadcast(self.inited.data, from_process=0)
 
     def replace_(self, samples, mask):
+        samples = filter_replacement_samples(samples)
         replacement = sample_vectors(samples, self.codebooks_size).to(self.embed.dtype)
         replacement_count = torch.full_like(
             self.cluster_size,

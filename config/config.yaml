@@ -31,7 +31,8 @@ training_config:
   pin_memory: True
   max_grad_norm: 1.0
   skip_anomalous_batches: True
-  anomaly_quantizer_loss_threshold: 1.0e+6
+  anomaly_quantizer_loss_threshold: 1.0e+4
+  anomaly_encoder_norm_threshold: 100.0
   anomaly_log_path: anomaly_batches.jsonl
 
   ### Logging Setup ###
