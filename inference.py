@@ -1,30 +1,44 @@
-import yaml
-import torch
-import torchaudio.transforms as T
-import torchaudio
+import argparse
+from pathlib import Path
 import warnings
+
 import matplotlib.pyplot as plt
-from utils import save_audios
-warnings.filterwarnings("ignore")
+import torch
+import torchaudio
+import torchaudio.transforms as T
+import yaml
 
 from modules.encodec import EncodecModel, EnCodecConfig
+from utils import save_audios
+
+warnings.filterwarnings("ignore")
+
 
 def load_yaml(path_to_yaml):
-    with open(path_to_yaml, 'r') as file:
-        config = yaml.safe_load(file)
-    return config
+    with open(path_to_yaml, "r") as file:
+        return yaml.safe_load(file)
+
+
+def first_manifest_path(path_to_manifest):
+    with open(path_to_manifest, "r") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                return line
+    raise ValueError(f"No audio paths found in {path_to_manifest}")
+
 
 def load_audio(path_to_audio, sr):
     waveform, audio_sr = torchaudio.load(path_to_audio)
 
     if audio_sr != sr:
-        resampler = torchaudio.transforms.Resample(audio_sr, sr)
-        waveform = resampler(waveform)    
-    
+        waveform = torchaudio.transforms.Resample(audio_sr, sr)(waveform)
+
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
     return waveform.unsqueeze(0)
+
 
 def compute_mel(audio, sr, n_fft=1024, hop_length=256, n_mels=80):
     mel_transform = T.MelSpectrogram(
@@ -33,13 +47,16 @@ def compute_mel(audio, sr, n_fft=1024, hop_length=256, n_mels=80):
         hop_length=hop_length,
         n_mels=n_mels,
         center=True,
-        power=2.0
+        power=2.0,
     )
-    mel = mel_transform(audio)  # (B, n_mels, T)
-    mel = torch.log(mel + 1e-5)
-    return mel
+    mel = mel_transform(audio)
+    return torch.log(mel + 1e-5)
 
-def plot_mel_comparison(original, reconstruction, sr):
+
+def plot_mel_comparison(original, reconstruction, sr, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     mel_orig = compute_mel(original.squeeze(0), sr)
     mel_recon = compute_mel(reconstruction.detach().cpu().squeeze(0), sr)
 
@@ -47,7 +64,7 @@ def plot_mel_comparison(original, reconstruction, sr):
     mel_recon = mel_recon.squeeze(0).numpy()
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-    
+
     im0 = axes[0].imshow(mel_orig, aspect="auto", origin="lower")
     axes[0].set_title("Original Audio Mel Spectrogram")
     axes[0].set_ylabel("Mel bins")
@@ -60,37 +77,53 @@ def plot_mel_comparison(original, reconstruction, sr):
     fig.colorbar(im1, ax=axes[1])
 
     plt.tight_layout()
-    plt.savefig("figs/french_reconstruction.png")
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Reconstruct audio with a trained EnCodec checkpoint.")
+    parser.add_argument("--config", default="config/config.yaml")
+    parser.add_argument(
+        "--checkpoint",
+        default="dir/EnCodecTrainerLibriTTS/checkpoint_190000/pytorch_model.bin",
+    )
+    parser.add_argument("--audio", default=None, help="Audio file to reconstruct. Defaults to first data/test.txt entry.")
+    parser.add_argument("--manifest", default="data/test.txt", help="Manifest used when --audio is omitted.")
+    parser.add_argument("--output", default="dir/EnCodecTrainerLibriTTS/manual_reconstruction.wav")
+    parser.add_argument("--spectrogram", default="dir/EnCodecTrainerLibriTTS/manual_reconstruction.png")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = load_yaml(args.config)
+    audio_path = args.audio or first_manifest_path(args.manifest)
+    sample_rate = config["training_config"]["sampling_rate"]
+
+    model = EncodecModel(EnCodecConfig(**config["generator_config"])).to(args.device)
+    state_dict = torch.load(args.checkpoint, map_location=args.device)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    audio = load_audio(audio_path, sample_rate).to(args.device)
+
+    with torch.no_grad():
+        tokens, scale = model.tokenize(audio)
+        reconstruction = model.decode(tokens, scale, max_len=audio.shape[-1])
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_audios(reconstruction.cpu(), str(output_path), sample_rate)
+    plot_mel_comparison(audio.cpu(), reconstruction.cpu(), sample_rate, args.spectrogram)
+
+    print(f"audio: {audio_path}")
+    print(f"checkpoint: {args.checkpoint}")
+    print(f"tokens shape: {tuple(tokens.shape)}")
+    print(f"reconstruction: {output_path}")
+    print(f"spectrogram: {args.spectrogram}")
+
 
 if __name__ == "__main__":
-
-    PATH_TO_CONFIG = "config/config.yaml"
-    PATH_TO_WEIGHTS = "dir/EnCodecTrainerLibriTTS/final_checkpoint/pytorch_model.bin"
-    PATH_TO_AUDIO = "ood_samples/french_sample.mp3"
-    config = load_yaml(PATH_TO_CONFIG)
-
-    encodec_config = EnCodecConfig(**config["generator_config"]
-    )
-    model = EncodecModel(encodec_config)
-    state_dict = torch.load(PATH_TO_WEIGHTS)
-    model.load_state_dict(state_dict)   
-
-    audio = load_audio(PATH_TO_AUDIO, config["training_config"]["sampling_rate"])
-    
-    tokens, scale = model.tokenize(audio)
-    print("Predicted Tokens")
-    print(tokens)
-
-    reconstruction = model.decode(tokens, scale)
-
-    plot_mel_comparison(
-        audio.cpu(),
-        reconstruction.cpu(),
-        config["training_config"]["sampling_rate"]
-    )
-
-    save_audios(reconstruction, "ood_samples/french_reconstruction.wav", 24000)
-    
-
-    
-    
+    main()

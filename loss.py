@@ -95,7 +95,8 @@ def generator_loss(
         input_wav,
         output_wav, 
         sample_rate=24000,
-        num_mels=80
+        num_mels=80,
+        feature_loss_epsilon=1e-8,
 ):
     
     time_loss = F.l1_loss(input_wav, output_wav)
@@ -125,7 +126,8 @@ def generator_loss(
         for freals, ffakes in zip(fmap_real, fmap_fake):
             for freal, ffake in zip(freals, ffakes):
                 ### normalize by torch.mean(torch.abs(freal)) so layers with large magnitudes dont dominate
-                feature_loss = feature_loss + F.l1_loss(freal, ffake) / torch.mean(torch.abs(freal))
+                denominator = torch.mean(torch.abs(freal)).clamp_min(feature_loss_epsilon)
+                feature_loss = feature_loss + F.l1_loss(freal, ffake) / denominator
 
         feature_loss = feature_loss / (K*L)
     

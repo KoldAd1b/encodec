@@ -100,8 +100,11 @@ class EncodecTrainer:
         ### Prepare Accelerator ###
         self.path_to_experiment = self._get_path_to_experiment()
         os.makedirs(self.path_to_experiment, exist_ok=True)
-        self.accelerator = Accelerator(project_dir=self.path_to_experiment, 
-                                       log_with="wandb" if self.log_wandb else None)
+        self.accelerator = Accelerator(
+            project_dir=self.path_to_experiment,
+            log_with="wandb" if self.log_wandb else None,
+            step_scheduler_with_optimizer=False,
+        )
         if hasattr(generator, "set_accelerator"):
             generator.set_accelerator(self.accelerator)
 
@@ -204,9 +207,14 @@ class EncodecTrainer:
             else:
                 self.train_files, self.test_files = self.train_test_split(audio_files, self.seed, self.test_pct)
 
+        split_payload = [self.train_files, self.test_files]
+        split_payload = accelerate.utils.broadcast_object_list(split_payload, from_process=0)
+        self.train_files, self.test_files = split_payload
+
         ### Cache the dataset in our experiment directory so we select the same train/test split during inference time ###
-        self._write_list_to_text(self.train_files, os.path.join(self.path_to_experiment, "train.txt"))
-        self._write_list_to_text(self.test_files, os.path.join(self.path_to_experiment, "test.txt"))
+        if self.accelerator.is_main_process:
+            self._write_list_to_text(self.train_files, os.path.join(self.path_to_experiment, "train.txt"))
+            self._write_list_to_text(self.test_files, os.path.join(self.path_to_experiment, "test.txt"))
 
         if self.accelerator.is_main_process:
             report = build_dataset_report(
@@ -229,6 +237,30 @@ class EncodecTrainer:
                                sample_rate=self.sampling_rate)
         
         return trainset, testset
+
+    def _select_reconstruction_samples(self, testset, resume):
+        path_to_samples = os.path.join(self.path_to_experiment, "samples.txt")
+        path_to_save_inputs = os.path.join(self.path_to_experiment, "gen_inputs")
+
+        if resume:
+            sampled_paths = self._load_paths_from_text(path_to_samples)
+        elif self.accelerator.is_main_process:
+            num_samples = min(self.num_samples_for_reconstruction, len(testset.audio_paths))
+            sampled_paths = random.sample(testset.audio_paths, k=num_samples)
+            self._write_list_to_text(sampled_paths, path_to_samples)
+            os.makedirs(path_to_save_inputs, exist_ok=True)
+
+            for i, path in enumerate(sampled_paths):
+                _, ext = os.path.splitext(path)
+                dst_path = os.path.join(path_to_save_inputs, f"gen_{i}{ext}")
+                shutil.copy(path, dst_path)
+        else:
+            sampled_paths = None
+
+        payload = [sampled_paths]
+        payload = accelerate.utils.broadcast_object_list(payload, from_process=0)
+        self.accelerator.wait_for_everyone()
+        return payload[0]
 
     def _grad_norm(self, parameters):
         norms = []
@@ -331,28 +363,7 @@ class EncodecTrainer:
                                 pin_memory=self.pin_memory)
         
         ### Load Cached Audios for Inference ###
-        if not resume:
-            num_samples = min(self.num_samples_for_reconstruction, len(testset.audio_paths))
-            sampled_paths = random.sample(testset.audio_paths, k=num_samples)
-            self._write_list_to_text(sampled_paths, os.path.join(self.path_to_experiment, "samples.txt"))
-            path_to_save_inputs = os.path.join(self.path_to_experiment, "gen_inputs")
-            os.makedirs(path_to_save_inputs, exist_ok=True)
-
-            ### make copy for easy access later ###
-            for i, path in enumerate(sampled_paths):
-                
-                # extract extension (.wav, .mp3, .flac, etc.)
-                _, ext = os.path.splitext(path)
-
-                # new filename with same extension
-                filename = f"gen_{i}{ext}"
-
-                # Copy
-                dst_path = os.path.join(path_to_save_inputs, filename)
-                shutil.copy(path, dst_path)
-
-        else:
-            sampled_paths = self._load_paths_from_text(os.path.join(self.path_to_experiment, "samples.txt"))
+        sampled_paths = self._select_reconstruction_samples(testset, resume)
         cached_audios = load_audios(sampled_paths, self.sampling_rate)
 
         ### Load Optimizers ###
@@ -587,6 +598,7 @@ class EncodecTrainer:
                         f"Feat: {train_feat_loss_str} | "
                         f"Disc: {disc_loss_str} | "
                         f"Quant: {train_commit_loss:.2e} | "
+                        f"Books: {int(output['num_books_to_use'].detach().item())} | "
                         f"LR: {scheduler.get_last_lr()[0]:.2e} | "
                         f"D_LR: {disc_lr_str}"
                     )
