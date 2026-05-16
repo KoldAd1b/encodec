@@ -1,6 +1,7 @@
 /example
 /papers
-.gitignore
+.*
+!.gitignore
 /AGENTS.md
 /data
 .vscode/
